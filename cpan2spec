@@ -44,6 +44,7 @@ cpan2spec [options] [file [...]]
     --library-perl-dir DIR  Custom directory for spec output (default: library-perl)
     --cleanup-source        Remove downloaded source archive after generation (default: on)
     --no-cleanup-source     Keep downloaded source archive
+    --no-postprocess -x     Skip buildsystem post-processing
 
  Long options:
    --follow             Process build dependencies
@@ -181,6 +182,12 @@ Add BuildRequires for this item.
 
 Print the version number and exit.
 
+=item B<-x>, B<--no-postprocess>
+
+Skip spec post-processing. With this option, B<cpan2spec> writes the
+original generated spec and does not apply buildsystem conversion or section
+omission rules.
+
 =back
 
 =head1 AUTHOR
@@ -231,6 +238,7 @@ our $macros=1;
 our $use_outdir=1;            # default: write specs under library-perl
 our $outdir='library-perl';   # default output dir
 our $cleanup_source=1;        # default: remove downloaded source archives
+our $skip_postprocess=0;      # default: enable spec post-processing
 our $source;
 our $cpan=$ENV{'CPAN'} || "http://www.cpan.org";
 
@@ -345,7 +353,33 @@ sub update_packages() {
 
     mkdir_p(dirname($pkgdetails)) if (!-d dirname($pkgdetails));
 
-    fetch("$cpan/modules/" . basename($pkgdetails), $pkgdetails);
+    my $is_valid_pkgdetails = sub {
+        my ($file)=@_;
+        return 0 if (!-f $file);
+
+        my $ok = system('gzip', '-t', $file);
+        return ($ok == 0) ? 1 : 0;
+    };
+
+    # If cached index is corrupt, remove it so fetch cannot return 304.
+    if (-f $pkgdetails and !$is_valid_pkgdetails->($pkgdetails)) {
+        warn "Cached package index is corrupt, removing: $pkgdetails\n";
+        unlink $pkgdetails or die "Failed to remove corrupt $pkgdetails: $!\n";
+    }
+
+    my $index_url = "$cpan/modules/" . basename($pkgdetails);
+    my $attempts = 0;
+    while ($attempts < 2) {
+        $attempts++;
+        fetch($index_url, $pkgdetails);
+        last if ($is_valid_pkgdetails->($pkgdetails));
+
+        warn "Downloaded package index appears truncated/corrupt (attempt $attempts): $pkgdetails\n";
+        unlink $pkgdetails;
+    }
+
+    die "Failed to fetch a valid CPAN package index from $index_url\n"
+        if (!$is_valid_pkgdetails->($pkgdetails));
 
     $updated=1;
 }
@@ -548,6 +582,258 @@ sub get_sha256($) {
     return "0" x 64;
 }
 
+sub section_bounds($$) {
+    my ($lines, $section)=@_;
+
+    my $is_section_header = sub {
+        my ($line)=@_;
+        return ($line =~ /^%(?:description|prep|build|install|check|files|changelog|package|pre|post|preun|postun|posttrans|trigger(?:in|un|postun)?|verifyscript)\b/);
+    };
+
+    my $start;
+    for (my $i=0; $i<@{$lines}; $i++) {
+        if ($lines->[$i] =~ /^\Q$section\E\b/) {
+            $start=$i;
+            last;
+        }
+    }
+    return (undef, undef) if (!defined($start));
+
+    my $end=@{$lines};
+    for (my $i=$start+1; $i<@{$lines}; $i++) {
+        if ($is_section_header->($lines->[$i])) {
+            $end=$i;
+            last;
+        }
+    }
+
+    return ($start, $end);
+}
+
+sub trimmed_section_lines($$) {
+    my ($lines, $section)=@_;
+    my ($start, $end)=section_bounds($lines, $section);
+    return () if (!defined($start));
+
+    my @body=@{$lines}[$start+1 .. $end-1];
+    while (@body and $body[0] =~ /^\s*$/) {
+        shift @body;
+    }
+    while (@body and $body[$#body] =~ /^\s*$/) {
+        pop @body;
+    }
+
+    return @body;
+}
+
+sub is_default_perlmaker_install {
+    my @lines=@_;
+
+    return 0 if (@lines < 3 or @lines > 4);
+    return 0 if ($lines[0] ne '%perl_make_install');
+    return 0 if ($lines[$#lines] ne '%perl_gen_filelist');
+
+    if (@lines == 3) {
+        return ($lines[1] eq '%perl_process_packlist') ? 1 : 0;
+    }
+
+    return 0 if ($lines[1] ne "find %{buildroot} -type f -name '*.bs' -size 0 -exec rm -f {} \\;");
+    return ($lines[2] eq '%perl_process_packlist') ? 1 : 0;
+}
+
+sub is_default_perlbuild_install {
+    my @lines=@_;
+
+    return 0 if (@lines < 2 or @lines > 4);
+    return 0 if ($lines[0] !~ m{^\./Build install (?:--)?destdir=%\{buildroot\} (?:--)?create_packlist=0$});
+    return 0 if ($lines[$#lines] ne '%perl_gen_filelist');
+
+    if (@lines == 2) {
+        return 1;
+    }
+
+    if (@lines == 3) {
+        return ($lines[1] eq '%perl_process_packlist') ? 1 : 0;
+    }
+
+    return 0 if ($lines[1] ne "find %{buildroot} -type f -name '*.bs' -size 0 -exec rm -f {} \\;");
+    return ($lines[2] eq '%perl_process_packlist') ? 1 : 0;
+}
+
+sub normalize_perlbuild_install_options {
+    my $opts=shift;
+
+    $opts =~ s/(^|\s)destdir=/$1--destdir=/g;
+    $opts =~ s/(^|\s)create_packlist=/$1--create_packlist=/g;
+
+    return $opts;
+}
+
+sub collapse_blank_lines($) {
+    my ($lines)=@_;
+
+    my @out;
+    my $blank_count=0;
+    for my $line (@{$lines}) {
+        if ($line =~ /^\s*$/) {
+            $blank_count++;
+            next if ($blank_count > 2);
+        } else {
+            $blank_count=0;
+        }
+        push @out, $line;
+    }
+
+    @{$lines}=@out;
+}
+
+sub postprocess_spec($) {
+    my $specfile=shift;
+
+    my $in=new FileHandle $specfile, 'r'
+        or die "Failed to open $specfile for reading: $!\n";
+    local $/=undef;
+    my $content=<$in>;
+    $in->close();
+
+    my @lines=split /\n/, $content;
+
+    my @build_lines=trimmed_section_lines(\@lines, '%build');
+    my @install_lines=trimmed_section_lines(\@lines, '%install');
+
+    my $buildsystem='';
+    my @build_options;
+    my @install_options;
+    my $omit_build=0;
+    my $omit_install=0;
+
+    my $perlmaker_build_ok = (
+        @build_lines >= 2
+        and $build_lines[0] =~ /^perl Makefile\.PL INSTALLDIRS=vendor(?: OPTIMIZE="%\{optflags\}")?$/
+        and $build_lines[1] eq '%{make_build}'
+    );
+    my $perlbuild_build_ok = (
+        @build_lines >= 2
+        and $build_lines[0] =~ /^perl Build\.PL --installdirs=vendor(?: optimize="%\{optflags\}")?$/
+        and $build_lines[1] eq './Build'
+    );
+
+    if ($perlmaker_build_ok) {
+        $buildsystem='perlmaker';
+        $omit_build=1;
+        if ($build_lines[0] =~ /^perl Makefile\.PL\s+(.+)$/) {
+            push @build_options, $1;
+        }
+        $omit_install = is_default_perlmaker_install(@install_lines) ? 1 : 0;
+    } elsif ($perlbuild_build_ok) {
+        $buildsystem='perlbuild';
+        $omit_build=1;
+        if ($build_lines[0] =~ /^perl Build\.PL\s+(.+)$/) {
+            push @build_options, $1;
+        }
+        if (@install_lines and $install_lines[0] =~ m{^\./Build install\s+(.+)$}) {
+            push @install_options, normalize_perlbuild_install_options($1);
+        }
+        $omit_install = is_default_perlbuild_install(@install_lines) ? 1 : 0;
+    } else {
+        if (@build_lines and $build_lines[0] =~ /^perl Makefile\.PL\b/) {
+            $buildsystem='perlmaker';
+            if ($build_lines[0] =~ /^perl Makefile\.PL\s+(.+)$/) {
+                push @build_options, $1;
+            }
+        } elsif (@build_lines and $build_lines[0] =~ /^perl Build\.PL\b/) {
+            $buildsystem='perlbuild';
+            if ($build_lines[0] =~ /^perl Build\.PL\s+(.+)$/) {
+                push @build_options, $1;
+            }
+            if (@install_lines and $install_lines[0] =~ m{^\./Build install\s+(.+)$}) {
+                push @install_options, normalize_perlbuild_install_options($1);
+            }
+        }
+    }
+
+    # Always ensure perl-rpm-macros is in BuildRequires.
+    my $has_rpm_macros = (grep { $_ =~ /^BuildRequires:\s+perl-rpm-macros\s*$/ } @lines) ? 1 : 0;
+    if (!$has_rpm_macros) {
+        my $insert_at;
+        for (my $i=0; $i<@lines; $i++) {
+            if ($lines[$i] =~ /^BuildRequires:\s+perl-rpm-packaging\s*$/) {
+                $insert_at=$i+1;
+                last;
+            }
+        }
+        if (!defined($insert_at)) {
+            for (my $i=0; $i<@lines; $i++) {
+                if ($lines[$i] =~ /^BuildRequires:\s+/) {
+                    $insert_at=$i;
+                    last;
+                }
+            }
+        }
+        splice @lines, $insert_at, 0, 'BuildRequires:  perl-rpm-macros' if (defined($insert_at));
+    }
+
+    # Remove previously generated BuildSystem/BuildOption headers, then reinsert.
+    @lines=grep {
+        $_ !~ /^BuildSystem:\s+/ and $_ !~ /^BuildOption\(build\):\s+/ and $_ !~ /^BuildOption\(install\):\s+/
+    } @lines;
+
+    if ($buildsystem) {
+        my $anchor;
+        for (my $i=0; $i<@lines; $i++) {
+            if ($lines[$i] =~ /^BuildArch:\s+/) {
+                $anchor=$i;
+                last;
+            }
+        }
+        if (!defined($anchor)) {
+            for (my $i=0; $i<@lines; $i++) {
+                if ($lines[$i] =~ /^Source0:\s+/) {
+                    $anchor=$i;
+                    last;
+                }
+            }
+        }
+
+        if (defined($anchor)) {
+            my @insert=('BuildSystem:    ' . $buildsystem);
+            if (@build_options or @install_options) {
+                push @insert, '';
+            }
+            for my $opt (@build_options) {
+                next if (!defined($opt) or $opt eq '');
+                push @insert, 'BuildOption(build):  ' . $opt;
+            }
+            for my $opt (@install_options) {
+                next if (!defined($opt) or $opt eq '');
+                push @insert, 'BuildOption(install):  ' . $opt;
+            }
+
+            splice @lines, $anchor+1, 0, @insert;
+        }
+    }
+
+    # %prep is always omitted.
+    my ($prep_s, $prep_e)=section_bounds(\@lines, '%prep');
+    splice @lines, $prep_s, $prep_e-$prep_s if (defined($prep_s));
+
+    if ($omit_build) {
+        my ($build_s, $build_e)=section_bounds(\@lines, '%build');
+        splice @lines, $build_s, $build_e-$build_s if (defined($build_s));
+    }
+    if ($omit_install) {
+        my ($install_s, $install_e)=section_bounds(\@lines, '%install');
+        splice @lines, $install_s, $install_e-$install_s if (defined($install_s));
+    }
+
+    collapse_blank_lines(\@lines);
+
+    my $out=new FileHandle ">$specfile"
+        or die "Failed to open $specfile for writing: $!\n";
+    print $out join("\n", @lines), "\n";
+    $out->close();
+}
+
 # Set locale to en_US.UTF8 so that dates in changelog will be correct
 # if using another locale. Also ensures writing out UTF8. (Thanks to
 # Roy-Magne Mo for pointing out the problem and providing a solution.)
@@ -578,6 +864,7 @@ GetOptions(
     'library-perl-dir=s' => \$outdir,
     'cleanup-source!'    => \$cleanup_source,
     'keep-source'        => sub { $cleanup_source = 0 },
+    'no-postprocess|x'   => \$skip_postprocess,
     ) or pod2usage({ -exitval => 1, -verbose => 0 });
 
 pod2usage({ -exitval => 0, -verbose => 1 }) if ($help);
@@ -1308,6 +1595,8 @@ END
 END
 
     $spec->close();
+
+    postprocess_spec($specfile) if (!$skip_postprocess);
 
     build_rpm($specfile) if ($buildsrpm or $buildrpm);
 
