@@ -582,6 +582,240 @@ sub get_sha256($) {
     return "0" x 64;
 }
 
+
+sub refine_license_from_files(%) {
+    my %args=@_;
+    my $archive=$args{archive};
+    my $type=$args{type};
+    my $path=$args{path};
+    my $current=$args{current} || '';
+    my @files=@{$args{files} || []};
+    my @license_files=@{$args{license_files} || []};
+
+    # Keep the original META.yml license parser above this function.  This
+    # routine is only a second pass over files that are actually shipped in the
+    # CPAN source archive.  It is intentionally small and conservative:
+    #
+    #   * First read explicit license files such as LICENSE, COPYING, ARTISTIC
+    #     and GPL*.  These files are the strongest evidence.
+    #   * If there is no explicit license file, read a few common documentation
+    #     files (README, Changes, .pm, .pod) because old CPAN modules often put
+    #     "same terms as Perl" only in POD.
+    #   * Do not scan tests or every file in the archive.  That avoids mixing in
+    #     unrelated license text from test data or bundled examples.
+    #   * Only replace an already specific META.yml result when the file gives a
+    #     clearly better answer, such as Artistic-2.0 instead of old metadata
+    #     value "artistic".
+
+    my @scan_files = @license_files;
+
+    if (!@scan_files) {
+        push @scan_files, grep {
+               !m{/(?:t|xt|inc|blib)/}
+            && (
+                   $_ =~ /^(?:README|README\.md|README\.txt)$/i
+                || $_ =~ /^(?:Changes|ChangeLog)$/i
+                || $_ =~ m{^(?:lib/)?[^/]+(?:/[^/]+)*\.(?:pm|pod)$}i
+               )
+        } @files;
+    }
+
+    my @detected;
+    my %seen;
+
+    for my $file (@scan_files) {
+        my $text=extract($archive, $type, "$path/$file");
+        next if (!defined($text) or $text eq '');
+
+        my $sample=substr($text, 0, 262144);
+        $sample =~ s/\r/\n/g;
+
+        my @found;
+        my %found_seen;
+        my $saw_dual=0;
+        my $add = sub {
+            my $license=shift;
+            return if (!defined($license) or $license eq '');
+            return if ($found_seen{$license}++);
+            push @found, $license;
+        };
+
+        # "same terms as Perl" is the usual CPAN shorthand for Perl's dual
+        # license: GPL-1.0-or-later OR Artistic-1.0-Perl.
+        if ($sample =~ /same terms as (?:perl|the perl programming language|perl itself)/i) {
+            $add->('GPL-1.0-or-later OR Artistic-1.0-Perl');
+            $saw_dual=1;
+        }
+
+        # Some files spell out "GPL or Artistic".  Keep GPL and Artistic version
+        # detection separate.  For example, B::Keywords says GPL version 2, but
+        # the Artistic license is "which comes with Perl", not Artistic 2.0.
+        if ($sample =~ /(?:GNU\s+(?:GENERAL\s+)?PUBLIC\s+LICENSE|GNU\s+public\s+license)/i
+            and $sample =~ /Artistic License/i
+            and ($sample =~ /under the terms of either/i
+                 or $sample =~ /terms of either/i
+                 or $sample =~ /which comes with Perl/i
+                 or $sample =~ /or\s+(?:the\s+)?Artistic License/i
+                 or $sample =~ /Artistic License.*?or.*?(?:GNU\s+)?(?:General\s+)?Public License/is
+                 or $sample =~ /(?:GNU\s+)?(?:General\s+)?Public License.*?or.*?Artistic License/is)) {
+            my $gpl='GPL-1.0-or-later';
+            my $artistic='Artistic-1.0-Perl';
+
+            if ($sample =~ /any version/i) {
+                $gpl='GPL-1.0-or-later';
+            } elsif ($sample =~ /(?:GNU\s+(?:GENERAL\s+)?PUBLIC\s+LICENSE|GNU\s+public\s+license).*?version\s+3/is) {
+                $gpl = ($sample =~ /or\s+(?:any\s+)?later\s+version/i) ? 'GPL-3.0-or-later' : 'GPL-3.0-only';
+            } elsif ($sample =~ /(?:GNU\s+(?:GENERAL\s+)?PUBLIC\s+LICENSE|GNU\s+public\s+license).*?version\s+2/is) {
+                $gpl = ($sample =~ /or\s+(?:any\s+)?later\s+version/i) ? 'GPL-2.0-or-later' : 'GPL-2.0-only';
+            } elsif ($sample =~ /(?:GNU\s+(?:GENERAL\s+)?PUBLIC\s+LICENSE|GNU\s+public\s+license).*?version\s+1/is) {
+                $gpl = ($sample =~ /or\s+(?:any\s+)?later\s+version/i) ? 'GPL-1.0-or-later' : 'GPL-1.0-only';
+            }
+
+            if ($sample =~ /Artistic License\s+2(?:\.0)?/i
+                or $sample =~ /Artistic License.*?Version\s+2(?:\.0)?/is
+                or $sample =~ /Artistic License.*?\bv2(?:\.0)?\b/is) {
+                $artistic='Artistic-2.0';
+            }
+            if ($sample =~ /Artistic License["']?\s+which comes with Perl/i) {
+                $artistic='Artistic-1.0-Perl';
+            }
+
+            $add->("$gpl OR $artistic");
+            $saw_dual=1;
+        }
+
+        if ($sample =~ /Apache License/i and $sample =~ /Version\s+2\.0/i) {
+            $add->('Apache-2.0');
+        }
+        if ($sample =~ /\bMIT License\b/i
+            or $sample =~ /Permission is hereby granted,\s+free of charge,\s+to any person obtaining a copy/i) {
+            $add->('MIT');
+        }
+        if ($sample =~ /\bISC License\b/i
+            or $sample =~ /Permission to use,\s+copy,\s+modify,\s+and\/or distribute this software for any purpose with or without fee/i) {
+            $add->('ISC');
+        }
+
+        # Check LGPL before GPL.  Also avoid a false LGPL hit from the standard
+        # GPL text, which mentions the Lesser GPL only in passing.
+        if (!$saw_dual and ($sample =~ /^\s*GNU LESSER GENERAL PUBLIC LICENSE/im
+            or ($sample =~ /Lesser General Public License\s*\(LGPL\)/i
+                and $sample !~ /^\s*GNU GENERAL PUBLIC LICENSE/im))) {
+            if ($sample =~ /Version\s+3/i) {
+                $add->(($sample =~ /or\s+(?:any\s+)?later\s+version/i) ? 'LGPL-3.0-or-later' : 'LGPL-3.0-only');
+            } elsif ($sample =~ /Version\s+2\.1/i) {
+                $add->(($sample =~ /or\s+(?:any\s+)?later\s+version/i) ? 'LGPL-2.1-or-later' : 'LGPL-2.1-only');
+            } elsif ($sample =~ /Version\s+2/i) {
+                $add->(($sample =~ /or\s+(?:any\s+)?later\s+version/i) ? 'LGPL-2.0-or-later' : 'LGPL-2.0-only');
+            } else {
+                $add->('LGPL-2.0-or-later');
+            }
+        }
+
+        if (!$saw_dual and ($sample =~ /^\s*GNU GENERAL PUBLIC LICENSE/im
+            or $sample =~ /GNU\s+public\s+license/i)) {
+            my $is_full_gpl_text = ($sample =~ /^\s*GNU GENERAL PUBLIC LICENSE/im);
+
+            # A full GPL license text contains explanatory wording about how
+            # "or later" works, but that does not by itself grant this package
+            # an "or later" license.  Only package-level wording should upgrade
+            # a concrete GPL version to "-or-later".
+            my $has_package_or_later =
+                (!$is_full_gpl_text
+                 and ($sample =~ /or\s+(?:any\s+)?later\s+version/i
+                      or $sample =~ /any version/i));
+
+            if ($sample =~ /Version\s+3/i) {
+                $add->($has_package_or_later ? 'GPL-3.0-or-later' : 'GPL-3.0-only');
+            } elsif ($sample =~ /Version\s+2/i) {
+                $add->($has_package_or_later ? 'GPL-2.0-or-later' : 'GPL-2.0-only');
+            } elsif ($sample =~ /Version\s+1/i) {
+                $add->($has_package_or_later ? 'GPL-1.0-or-later' : 'GPL-1.0-only');
+            } elsif ($sample =~ /any version/i) {
+                $add->('GPL-1.0-or-later');
+            } else {
+                $add->('GPL-1.0-or-later');
+            }
+        }
+
+        if (!$saw_dual and $sample =~ /Artistic License/i) {
+            if ($sample =~ /Artistic License\s+2(?:\.0)?/i
+                or $sample =~ /The\s+Artistic\s+License\s+2(?:\.0)?/i
+                or $sample =~ /Artistic License.*?\bv2(?:\.0)?\b/is) {
+                $add->('Artistic-2.0');
+            } else {
+                $add->('Artistic-1.0-Perl');
+            }
+        }
+
+        if ($sample =~ /Mozilla Public License/i) {
+            if ($sample =~ /Version\s+2\.0/i) {
+                $add->('MPL-2.0');
+            } elsif ($sample =~ /Version\s+1\.1/i) {
+                $add->('MPL-1.1');
+            } elsif ($sample =~ /Version\s+1\.0/i) {
+                $add->('MPL-1.0');
+            }
+        }
+        
+        if ($sample =~ /Redistribution and use in source and binary forms/i
+            and $sample =~ /THIS SOFTWARE IS PROVIDED/i) {
+            $add->('BSD');
+        }
+
+        # If content matching did not fire, use very explicit license file names
+        # as a last resort.  GPL2.txt in CPAN distributions usually means the
+        # package offers GPLv2-or-later as one choice, but a full GPLv2 COPYING
+        # text without package-level "or later" wording remains GPL-2.0-only.
+        if (!@found) {
+            my $base=basename($file);
+            if ($base =~ /^ARTISTIC.*2/i) {
+                $add->('Artistic-2.0');
+            } elsif ($base =~ /^ARTISTIC/i) {
+                $add->('Artistic-1.0-Perl');
+            } elsif ($base =~ /LGPL.*3/i) {
+                $add->('LGPL-3.0-or-later');
+            } elsif ($base =~ /LGPL.*2[._-]?1/i) {
+                $add->('LGPL-2.1-or-later');
+            } elsif ($base =~ /LGPL.*2/i) {
+                $add->('LGPL-2.0-or-later');
+            } elsif ($base =~ /GPL.*3/i) {
+                $add->('GPL-3.0-or-later');
+            } elsif ($base =~ /GPL.*2/i) {
+                $add->('GPL-2.0-or-later');
+            } elsif ($base =~ /^GPL/i) {
+                $add->('GPL-1.0-or-later');
+            }
+        }
+
+        # A standard GPL text may mention the Artistic license only because it
+        # is bundled with another file in the distribution.  Keep each explicit
+        # license file's own result; later we join the unique results from all
+        # explicit license files with OR.
+        for my $license (@found) {
+            next if (!$license);
+            next if ($seen{$license}++);
+            push @detected, $license;
+        }
+    }
+
+    my $from_files=join(' OR ', @detected);
+
+    if ($from_files) {
+        return $from_files
+            if (!$current
+                or $current =~ /^CHECK\(/
+                or $current =~ /^(?:any-OSI|Distributable|Non-distributable)(?:,|$)/
+                or ($current eq 'Artistic-1.0-Perl' and $from_files =~ /^Artistic-2\.0\b/)
+                or ($current eq 'GPL-1.0-or-later' and $from_files =~ /^GPL-\d+(?:\.\d+)?-(?:only|or-later)$/));
+    }
+
+    return 'CHECK(GPL-1.0-or-later OR Artistic-1.0-Perl)'
+        if (!$current or $current eq 'CHECK(Distributable)');
+
+    return $current;
+}
+
 sub section_bounds($$) {
     my ($lines, $section)=@_;
 
@@ -1278,7 +1512,51 @@ for my $file (@args) {
             $license.=", see @licenses";
         }
     }
-    $license="CHECK(GPL-1.0-or-later OR Artistic-1.0-Perl)" if (!$license);
+
+    $license=refine_license_from_files(
+        archive       => $archive,
+        type          => $type,
+        path          => $path,
+        files         => \@files,
+        license_files => \@license,
+        current       => $license,
+    );
+
+    # Normalize redundant GPL/LGPL alternatives produced by file scanning.
+    #
+    # Some source texts mention both a broad form and a narrow form for the
+    # same license family and version, for example:
+    #
+    #   LGPL-2.0-or-later OR LGPL-2.0-only
+    #
+    # The "or-later" form already covers the same version and later versions,
+    # so keeping the matching "only" term only makes the generated License tag
+    # noisier.  This block only cleans up an already-detected expression; it
+    # does not infer any new license and does not touch CHECK(...) values.
+    if ($license !~ /^CHECK\(/) {
+        my @terms = split /\s+OR\s+/, $license;
+        my %has_or_later;
+
+        for my $term (@terms) {
+            if ($term =~ /^(GPL|LGPL)-(\d+(?:\.\d+)?)-or-later$/) {
+                $has_or_later{"$1-$2"} = 1;
+            }
+        }
+
+        my @kept;
+        my %seen;
+        for my $term (@terms) {
+            if ($term =~ /^(GPL|LGPL)-(\d+(?:\.\d+)?)-only$/
+                and $has_or_later{"$1-$2"}) {
+                next;
+            }
+
+            next if ($seen{$term}++);
+            push @kept, $term;
+        }
+
+        $license = join(' OR ', @kept);
+    }
 
     my $usebuildpl=0;
     if (grep /^Build\.PL$/, @files) {
