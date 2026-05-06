@@ -44,6 +44,7 @@ cpan2spec [options] [file [...]]
     --library-perl-dir DIR  Custom directory for spec output (default: library-perl)
     --cleanup-source        Remove downloaded source archive after generation (default: on)
     --no-cleanup-source     Keep downloaded source archive
+    --no-postprocess -x     Skip buildsystem post-processing
 
  Long options:
    --follow             Process build dependencies
@@ -181,6 +182,12 @@ Add BuildRequires for this item.
 
 Print the version number and exit.
 
+=item B<-x>, B<--no-postprocess>
+
+Skip spec post-processing. With this option, B<cpan2spec> writes the
+original generated spec and does not apply buildsystem conversion or section
+omission rules.
+
 =back
 
 =head1 AUTHOR
@@ -231,6 +238,7 @@ our $macros=1;
 our $use_outdir=1;            # default: write specs under library-perl
 our $outdir='library-perl';   # default output dir
 our $cleanup_source=1;        # default: remove downloaded source archives
+our $skip_postprocess=0;      # default: enable spec post-processing
 our $source;
 our $cpan=$ENV{'CPAN'} || "http://www.cpan.org";
 
@@ -345,7 +353,33 @@ sub update_packages() {
 
     mkdir_p(dirname($pkgdetails)) if (!-d dirname($pkgdetails));
 
-    fetch("$cpan/modules/" . basename($pkgdetails), $pkgdetails);
+    my $is_valid_pkgdetails = sub {
+        my ($file)=@_;
+        return 0 if (!-f $file);
+
+        my $ok = system('gzip', '-t', $file);
+        return ($ok == 0) ? 1 : 0;
+    };
+
+    # If cached index is corrupt, remove it so fetch cannot return 304.
+    if (-f $pkgdetails and !$is_valid_pkgdetails->($pkgdetails)) {
+        warn "Cached package index is corrupt, removing: $pkgdetails\n";
+        unlink $pkgdetails or die "Failed to remove corrupt $pkgdetails: $!\n";
+    }
+
+    my $index_url = "$cpan/modules/" . basename($pkgdetails);
+    my $attempts = 0;
+    while ($attempts < 2) {
+        $attempts++;
+        fetch($index_url, $pkgdetails);
+        last if ($is_valid_pkgdetails->($pkgdetails));
+
+        warn "Downloaded package index appears truncated/corrupt (attempt $attempts): $pkgdetails\n";
+        unlink $pkgdetails;
+    }
+
+    die "Failed to fetch a valid CPAN package index from $index_url\n"
+        if (!$is_valid_pkgdetails->($pkgdetails));
 
     $updated=1;
 }
@@ -528,6 +562,512 @@ sub check_dep($) {
     return (check_rpm("perl($module)") || check_repo("perl($module)"));
 }
 
+# calculate the SHA256 of a file, returning a string of 64 zeros if the file doesn't exist or an error occurs
+sub get_sha256($) {
+    my $file=shift;
+
+    return "0" x 64 if (!-f $file);
+
+    my @output=`sha256sum "$file" 2>/dev/null`;
+
+    if ($? != 0) {
+        warn "Failed to calculate SHA256 for $file: $!\n";
+        return "0" x 64;
+    }
+
+    if (@output && $output[0] =~ /^([a-f0-9]{64})\s+/) {
+        return $1;
+    }
+
+    return "0" x 64;
+}
+
+
+sub refine_license_from_files(%) {
+    my %args=@_;
+    my $archive=$args{archive};
+    my $type=$args{type};
+    my $path=$args{path};
+    my $current=$args{current} || '';
+    my @files=@{$args{files} || []};
+    my @license_files=@{$args{license_files} || []};
+
+    # Keep the original META.yml license parser above this function.  This
+    # routine is only a second pass over files that are actually shipped in the
+    # CPAN source archive.  It is intentionally small and conservative:
+    #
+    #   * First read explicit license files such as LICENSE, COPYING, ARTISTIC
+    #     and GPL*.  These files are the strongest evidence.
+    #   * If there is no explicit license file, read a few common documentation
+    #     files (README, Changes, .pm, .pod) because old CPAN modules often put
+    #     "same terms as Perl" only in POD.
+    #   * Do not scan tests or every file in the archive.  That avoids mixing in
+    #     unrelated license text from test data or bundled examples.
+    #   * Only replace an already specific META.yml result when the file gives a
+    #     clearly better answer, such as Artistic-2.0 instead of old metadata
+    #     value "artistic".
+
+    my @scan_files = @license_files;
+
+    if (!@scan_files) {
+        push @scan_files, grep {
+               !m{/(?:t|xt|inc|blib)/}
+            && (
+                   $_ =~ /^(?:README|README\.md|README\.txt)$/i
+                || $_ =~ /^(?:Changes|ChangeLog)$/i
+                || $_ =~ m{^(?:lib/)?[^/]+(?:/[^/]+)*\.(?:pm|pod)$}i
+               )
+        } @files;
+    }
+
+    my @detected;
+    my %seen;
+
+    for my $file (@scan_files) {
+        my $text=extract($archive, $type, "$path/$file");
+        next if (!defined($text) or $text eq '');
+
+        my $sample=substr($text, 0, 262144);
+        $sample =~ s/\r/\n/g;
+
+        my @found;
+        my %found_seen;
+        my $saw_dual=0;
+        my $add = sub {
+            my $license=shift;
+            return if (!defined($license) or $license eq '');
+            return if ($found_seen{$license}++);
+            push @found, $license;
+        };
+
+        # "same terms as Perl" is the usual CPAN shorthand for Perl's dual
+        # license: GPL-1.0-or-later OR Artistic-1.0-Perl.
+        if ($sample =~ /same terms as (?:perl|the perl programming language|perl itself)/i) {
+            $add->('GPL-1.0-or-later OR Artistic-1.0-Perl');
+            $saw_dual=1;
+        }
+
+        # Some files spell out "GPL or Artistic".  Keep GPL and Artistic version
+        # detection separate.  For example, B::Keywords says GPL version 2, but
+        # the Artistic license is "which comes with Perl", not Artistic 2.0.
+        if ($sample =~ /(?:GNU\s+(?:GENERAL\s+)?PUBLIC\s+LICENSE|GNU\s+public\s+license)/i
+            and $sample =~ /Artistic License/i
+            and ($sample =~ /under the terms of either/i
+                 or $sample =~ /terms of either/i
+                 or $sample =~ /which comes with Perl/i
+                 or $sample =~ /or\s+(?:the\s+)?Artistic License/i
+                 or $sample =~ /Artistic License.*?or.*?(?:GNU\s+)?(?:General\s+)?Public License/is
+                 or $sample =~ /(?:GNU\s+)?(?:General\s+)?Public License.*?or.*?Artistic License/is)) {
+            my $gpl='GPL-1.0-or-later';
+            my $artistic='Artistic-1.0-Perl';
+
+            if ($sample =~ /any version/i) {
+                $gpl='GPL-1.0-or-later';
+            } elsif ($sample =~ /(?:GNU\s+(?:GENERAL\s+)?PUBLIC\s+LICENSE|GNU\s+public\s+license).*?version\s+3/is) {
+                $gpl = ($sample =~ /or\s+(?:any\s+)?later\s+version/i) ? 'GPL-3.0-or-later' : 'GPL-3.0-only';
+            } elsif ($sample =~ /(?:GNU\s+(?:GENERAL\s+)?PUBLIC\s+LICENSE|GNU\s+public\s+license).*?version\s+2/is) {
+                $gpl = ($sample =~ /or\s+(?:any\s+)?later\s+version/i) ? 'GPL-2.0-or-later' : 'GPL-2.0-only';
+            } elsif ($sample =~ /(?:GNU\s+(?:GENERAL\s+)?PUBLIC\s+LICENSE|GNU\s+public\s+license).*?version\s+1/is) {
+                $gpl = ($sample =~ /or\s+(?:any\s+)?later\s+version/i) ? 'GPL-1.0-or-later' : 'GPL-1.0-only';
+            }
+
+            if ($sample =~ /Artistic License\s+2(?:\.0)?/i
+                or $sample =~ /Artistic License.*?Version\s+2(?:\.0)?/is
+                or $sample =~ /Artistic License.*?\bv2(?:\.0)?\b/is) {
+                $artistic='Artistic-2.0';
+            }
+            if ($sample =~ /Artistic License["']?\s+which comes with Perl/i) {
+                $artistic='Artistic-1.0-Perl';
+            }
+
+            $add->("$gpl OR $artistic");
+            $saw_dual=1;
+        }
+
+        if ($sample =~ /Apache License/i and $sample =~ /Version\s+2\.0/i) {
+            $add->('Apache-2.0');
+        }
+        if ($sample =~ /\bMIT License\b/i
+            or $sample =~ /Permission is hereby granted,\s+free of charge,\s+to any person obtaining a copy/i) {
+            $add->('MIT');
+        }
+        if ($sample =~ /\bISC License\b/i
+            or $sample =~ /Permission to use,\s+copy,\s+modify,\s+and\/or distribute this software for any purpose with or without fee/i) {
+            $add->('ISC');
+        }
+
+        # Check LGPL before GPL.  Also avoid a false LGPL hit from the standard
+        # GPL text, which mentions the Lesser GPL only in passing.
+        if (!$saw_dual and ($sample =~ /^\s*GNU LESSER GENERAL PUBLIC LICENSE/im
+            or ($sample =~ /Lesser General Public License\s*\(LGPL\)/i
+                and $sample !~ /^\s*GNU GENERAL PUBLIC LICENSE/im))) {
+            if ($sample =~ /Version\s+3/i) {
+                $add->(($sample =~ /or\s+(?:any\s+)?later\s+version/i) ? 'LGPL-3.0-or-later' : 'LGPL-3.0-only');
+            } elsif ($sample =~ /Version\s+2\.1/i) {
+                $add->(($sample =~ /or\s+(?:any\s+)?later\s+version/i) ? 'LGPL-2.1-or-later' : 'LGPL-2.1-only');
+            } elsif ($sample =~ /Version\s+2/i) {
+                $add->(($sample =~ /or\s+(?:any\s+)?later\s+version/i) ? 'LGPL-2.0-or-later' : 'LGPL-2.0-only');
+            } else {
+                $add->('LGPL-2.0-or-later');
+            }
+        }
+
+        if (!$saw_dual and ($sample =~ /^\s*GNU GENERAL PUBLIC LICENSE/im
+            or $sample =~ /GNU\s+public\s+license/i)) {
+            my $is_full_gpl_text = ($sample =~ /^\s*GNU GENERAL PUBLIC LICENSE/im);
+
+            # A full GPL license text contains explanatory wording about how
+            # "or later" works, but that does not by itself grant this package
+            # an "or later" license.  Only package-level wording should upgrade
+            # a concrete GPL version to "-or-later".
+            my $has_package_or_later =
+                (!$is_full_gpl_text
+                 and ($sample =~ /or\s+(?:any\s+)?later\s+version/i
+                      or $sample =~ /any version/i));
+
+            if ($sample =~ /Version\s+3/i) {
+                $add->($has_package_or_later ? 'GPL-3.0-or-later' : 'GPL-3.0-only');
+            } elsif ($sample =~ /Version\s+2/i) {
+                $add->($has_package_or_later ? 'GPL-2.0-or-later' : 'GPL-2.0-only');
+            } elsif ($sample =~ /Version\s+1/i) {
+                $add->($has_package_or_later ? 'GPL-1.0-or-later' : 'GPL-1.0-only');
+            } elsif ($sample =~ /any version/i) {
+                $add->('GPL-1.0-or-later');
+            } else {
+                $add->('GPL-1.0-or-later');
+            }
+        }
+
+        if (!$saw_dual and $sample =~ /Artistic License/i) {
+            if ($sample =~ /Artistic License\s+2(?:\.0)?/i
+                or $sample =~ /The\s+Artistic\s+License\s+2(?:\.0)?/i
+                or $sample =~ /Artistic License.*?\bv2(?:\.0)?\b/is) {
+                $add->('Artistic-2.0');
+            } else {
+                $add->('Artistic-1.0-Perl');
+            }
+        }
+
+        if ($sample =~ /Mozilla Public License/i) {
+            if ($sample =~ /Version\s+2\.0/i) {
+                $add->('MPL-2.0');
+            } elsif ($sample =~ /Version\s+1\.1/i) {
+                $add->('MPL-1.1');
+            } elsif ($sample =~ /Version\s+1\.0/i) {
+                $add->('MPL-1.0');
+            }
+        }
+        
+        if ($sample =~ /Redistribution and use in source and binary forms/i
+            and $sample =~ /THIS SOFTWARE IS PROVIDED/i) {
+            $add->('BSD');
+        }
+
+        # If content matching did not fire, use very explicit license file names
+        # as a last resort.  GPL2.txt in CPAN distributions usually means the
+        # package offers GPLv2-or-later as one choice, but a full GPLv2 COPYING
+        # text without package-level "or later" wording remains GPL-2.0-only.
+        if (!@found) {
+            my $base=basename($file);
+            if ($base =~ /^ARTISTIC.*2/i) {
+                $add->('Artistic-2.0');
+            } elsif ($base =~ /^ARTISTIC/i) {
+                $add->('Artistic-1.0-Perl');
+            } elsif ($base =~ /LGPL.*3/i) {
+                $add->('LGPL-3.0-or-later');
+            } elsif ($base =~ /LGPL.*2[._-]?1/i) {
+                $add->('LGPL-2.1-or-later');
+            } elsif ($base =~ /LGPL.*2/i) {
+                $add->('LGPL-2.0-or-later');
+            } elsif ($base =~ /GPL.*3/i) {
+                $add->('GPL-3.0-or-later');
+            } elsif ($base =~ /GPL.*2/i) {
+                $add->('GPL-2.0-or-later');
+            } elsif ($base =~ /^GPL/i) {
+                $add->('GPL-1.0-or-later');
+            }
+        }
+
+        # A standard GPL text may mention the Artistic license only because it
+        # is bundled with another file in the distribution.  Keep each explicit
+        # license file's own result; later we join the unique results from all
+        # explicit license files with OR.
+        for my $license (@found) {
+            next if (!$license);
+            next if ($seen{$license}++);
+            push @detected, $license;
+        }
+    }
+
+    my $from_files=join(' OR ', @detected);
+
+    if ($from_files) {
+        return $from_files
+            if (!$current
+                or $current =~ /^CHECK\(/
+                or $current =~ /^(?:any-OSI|Distributable|Non-distributable)(?:,|$)/
+                or ($current eq 'Artistic-1.0-Perl' and $from_files =~ /^Artistic-2\.0\b/)
+                or ($current eq 'GPL-1.0-or-later' and $from_files =~ /^GPL-\d+(?:\.\d+)?-(?:only|or-later)$/));
+    }
+
+    return 'CHECK(GPL-1.0-or-later OR Artistic-1.0-Perl)'
+        if (!$current or $current eq 'CHECK(Distributable)');
+
+    return $current;
+}
+
+sub section_bounds($$) {
+    my ($lines, $section)=@_;
+
+    my $is_section_header = sub {
+        my ($line)=@_;
+        return ($line =~ /^%(?:description|prep|build|install|check|files|changelog|package|pre|post|preun|postun|posttrans|trigger(?:in|un|postun)?|verifyscript)\b/);
+    };
+
+    my $start;
+    for (my $i=0; $i<@{$lines}; $i++) {
+        if ($lines->[$i] =~ /^\Q$section\E\b/) {
+            $start=$i;
+            last;
+        }
+    }
+    return (undef, undef) if (!defined($start));
+
+    my $end=@{$lines};
+    for (my $i=$start+1; $i<@{$lines}; $i++) {
+        if ($is_section_header->($lines->[$i])) {
+            $end=$i;
+            last;
+        }
+    }
+
+    return ($start, $end);
+}
+
+sub trimmed_section_lines($$) {
+    my ($lines, $section)=@_;
+    my ($start, $end)=section_bounds($lines, $section);
+    return () if (!defined($start));
+
+    my @body=@{$lines}[$start+1 .. $end-1];
+    while (@body and $body[0] =~ /^\s*$/) {
+        shift @body;
+    }
+    while (@body and $body[$#body] =~ /^\s*$/) {
+        pop @body;
+    }
+
+    return @body;
+}
+
+sub is_default_perlmaker_install {
+    my @lines=@_;
+
+    return 0 if (@lines < 3 or @lines > 4);
+    return 0 if ($lines[0] ne '%perl_make_install');
+    return 0 if ($lines[$#lines] ne '%perl_gen_filelist');
+
+    if (@lines == 3) {
+        return ($lines[1] eq '%perl_process_packlist') ? 1 : 0;
+    }
+
+    return 0 if ($lines[1] ne "find %{buildroot} -type f -name '*.bs' -size 0 -exec rm -f {} \\;");
+    return ($lines[2] eq '%perl_process_packlist') ? 1 : 0;
+}
+
+sub is_default_perlbuild_install {
+    my @lines=@_;
+
+    return 0 if (@lines < 2 or @lines > 4);
+    return 0 if ($lines[0] !~ m{^\./Build install (?:--)?destdir=%\{buildroot\} (?:--)?create_packlist=0$});
+    return 0 if ($lines[$#lines] ne '%perl_gen_filelist');
+
+    if (@lines == 2) {
+        return 1;
+    }
+
+    if (@lines == 3) {
+        return ($lines[1] eq '%perl_process_packlist') ? 1 : 0;
+    }
+
+    return 0 if ($lines[1] ne "find %{buildroot} -type f -name '*.bs' -size 0 -exec rm -f {} \\;");
+    return ($lines[2] eq '%perl_process_packlist') ? 1 : 0;
+}
+
+sub normalize_perlbuild_install_options {
+    my $opts=shift;
+
+    $opts =~ s/(^|\s)destdir=/$1--destdir=/g;
+    $opts =~ s/(^|\s)create_packlist=/$1--create_packlist=/g;
+
+    return $opts;
+}
+
+sub collapse_blank_lines($) {
+    my ($lines)=@_;
+
+    my @out;
+    my $blank_count=0;
+    for my $line (@{$lines}) {
+        if ($line =~ /^\s*$/) {
+            $blank_count++;
+            next if ($blank_count > 2);
+        } else {
+            $blank_count=0;
+        }
+        push @out, $line;
+    }
+
+    @{$lines}=@out;
+}
+
+sub postprocess_spec($) {
+    my $specfile=shift;
+
+    my $in=new FileHandle $specfile, 'r'
+        or die "Failed to open $specfile for reading: $!\n";
+    local $/=undef;
+    my $content=<$in>;
+    $in->close();
+
+    my @lines=split /\n/, $content;
+
+    my @build_lines=trimmed_section_lines(\@lines, '%build');
+    my @install_lines=trimmed_section_lines(\@lines, '%install');
+
+    my $buildsystem='';
+    my @build_options;
+    my @install_options;
+    my $omit_build=0;
+    my $omit_install=0;
+
+    my $perlmaker_build_ok = (
+        @build_lines >= 2
+        and $build_lines[0] =~ /^perl Makefile\.PL INSTALLDIRS=vendor(?: OPTIMIZE="%\{optflags\}")?$/
+        and $build_lines[1] eq '%{make_build}'
+    );
+    my $perlbuild_build_ok = (
+        @build_lines >= 2
+        and $build_lines[0] =~ /^perl Build\.PL --installdirs=vendor(?: optimize="%\{optflags\}")?$/
+        and $build_lines[1] eq './Build'
+    );
+
+    if ($perlmaker_build_ok) {
+        $buildsystem='perlmaker';
+        $omit_build=1;
+        if ($build_lines[0] =~ /^perl Makefile\.PL\s+(.+)$/) {
+            push @build_options, $1;
+        }
+        $omit_install = is_default_perlmaker_install(@install_lines) ? 1 : 0;
+    } elsif ($perlbuild_build_ok) {
+        $buildsystem='perlbuild';
+        $omit_build=1;
+        if ($build_lines[0] =~ /^perl Build\.PL\s+(.+)$/) {
+            push @build_options, $1;
+        }
+        if (@install_lines and $install_lines[0] =~ m{^\./Build install\s+(.+)$}) {
+            push @install_options, normalize_perlbuild_install_options($1);
+        }
+        $omit_install = is_default_perlbuild_install(@install_lines) ? 1 : 0;
+    } else {
+        if (@build_lines and $build_lines[0] =~ /^perl Makefile\.PL\b/) {
+            $buildsystem='perlmaker';
+            if ($build_lines[0] =~ /^perl Makefile\.PL\s+(.+)$/) {
+                push @build_options, $1;
+            }
+        } elsif (@build_lines and $build_lines[0] =~ /^perl Build\.PL\b/) {
+            $buildsystem='perlbuild';
+            if ($build_lines[0] =~ /^perl Build\.PL\s+(.+)$/) {
+                push @build_options, $1;
+            }
+            if (@install_lines and $install_lines[0] =~ m{^\./Build install\s+(.+)$}) {
+                push @install_options, normalize_perlbuild_install_options($1);
+            }
+        }
+    }
+
+    # Always ensure perl-rpm-macros is in BuildRequires.
+    my $has_rpm_macros = (grep { $_ =~ /^BuildRequires:\s+perl-rpm-macros\s*$/ } @lines) ? 1 : 0;
+    if (!$has_rpm_macros) {
+        my $insert_at;
+        for (my $i=0; $i<@lines; $i++) {
+            if ($lines[$i] =~ /^BuildRequires:\s+perl-rpm-packaging\s*$/) {
+                $insert_at=$i+1;
+                last;
+            }
+        }
+        if (!defined($insert_at)) {
+            for (my $i=0; $i<@lines; $i++) {
+                if ($lines[$i] =~ /^BuildRequires:\s+/) {
+                    $insert_at=$i;
+                    last;
+                }
+            }
+        }
+        splice @lines, $insert_at, 0, 'BuildRequires:  perl-rpm-macros' if (defined($insert_at));
+    }
+
+    # Remove previously generated BuildSystem/BuildOption headers, then reinsert.
+    @lines=grep {
+        $_ !~ /^BuildSystem:\s+/ and $_ !~ /^BuildOption\(build\):\s+/ and $_ !~ /^BuildOption\(install\):\s+/
+    } @lines;
+
+    if ($buildsystem) {
+        my $anchor;
+        for (my $i=0; $i<@lines; $i++) {
+            if ($lines[$i] =~ /^BuildArch:\s+/) {
+                $anchor=$i;
+                last;
+            }
+        }
+        if (!defined($anchor)) {
+            for (my $i=0; $i<@lines; $i++) {
+                if ($lines[$i] =~ /^Source0:\s+/) {
+                    $anchor=$i;
+                    last;
+                }
+            }
+        }
+
+        if (defined($anchor)) {
+            my @insert=('BuildSystem:    ' . $buildsystem);
+            if (@build_options or @install_options) {
+                push @insert, '';
+            }
+            for my $opt (@build_options) {
+                next if (!defined($opt) or $opt eq '');
+                push @insert, 'BuildOption(build):  ' . $opt;
+            }
+            for my $opt (@install_options) {
+                next if (!defined($opt) or $opt eq '');
+                push @insert, 'BuildOption(install):  ' . $opt;
+            }
+
+            splice @lines, $anchor+1, 0, @insert;
+        }
+    }
+
+    # %prep is always omitted.
+    my ($prep_s, $prep_e)=section_bounds(\@lines, '%prep');
+    splice @lines, $prep_s, $prep_e-$prep_s if (defined($prep_s));
+
+    if ($omit_build) {
+        my ($build_s, $build_e)=section_bounds(\@lines, '%build');
+        splice @lines, $build_s, $build_e-$build_s if (defined($build_s));
+    }
+    if ($omit_install) {
+        my ($install_s, $install_e)=section_bounds(\@lines, '%install');
+        splice @lines, $install_s, $install_e-$install_s if (defined($install_s));
+    }
+
+    collapse_blank_lines(\@lines);
+
+    my $out=new FileHandle ">$specfile"
+        or die "Failed to open $specfile for writing: $!\n";
+    print $out join("\n", @lines), "\n";
+    $out->close();
+}
+
 # Set locale to en_US.UTF8 so that dates in changelog will be correct
 # if using another locale. Also ensures writing out UTF8. (Thanks to
 # Roy-Magne Mo for pointing out the problem and providing a solution.)
@@ -558,6 +1098,7 @@ GetOptions(
     'library-perl-dir=s' => \$outdir,
     'cleanup-source!'    => \$cleanup_source,
     'keep-source'        => sub { $cleanup_source = 0 },
+    'no-postprocess|x'   => \$skip_postprocess,
     ) or pod2usage({ -exitval => 1, -verbose => 0 });
 
 pod2usage({ -exitval => 0, -verbose => 1 }) if ($help);
@@ -644,6 +1185,12 @@ for my $file (@args) {
 
     my $module=$name;
     $module=~s/-/::/g;
+
+    my $sha256="";
+    if ($downloaded and -f $file) {
+        $sha256=get_sha256($file);
+        verbose("SHA256: $sha256");
+    }
 
     my $archive;
     my $path;
@@ -965,7 +1512,51 @@ for my $file (@args) {
             $license.=", see @licenses";
         }
     }
-    $license="CHECK(GPL-1.0-or-later OR Artistic-1.0-Perl)" if (!$license);
+
+    $license=refine_license_from_files(
+        archive       => $archive,
+        type          => $type,
+        path          => $path,
+        files         => \@files,
+        license_files => \@license,
+        current       => $license,
+    );
+
+    # Normalize redundant GPL/LGPL alternatives produced by file scanning.
+    #
+    # Some source texts mention both a broad form and a narrow form for the
+    # same license family and version, for example:
+    #
+    #   LGPL-2.0-or-later OR LGPL-2.0-only
+    #
+    # The "or-later" form already covers the same version and later versions,
+    # so keeping the matching "only" term only makes the generated License tag
+    # noisier.  This block only cleans up an already-detected expression; it
+    # does not infer any new license and does not touch CHECK(...) values.
+    if ($license !~ /^CHECK\(/) {
+        my @terms = split /\s+OR\s+/, $license;
+        my %has_or_later;
+
+        for my $term (@terms) {
+            if ($term =~ /^(GPL|LGPL)-(\d+(?:\.\d+)?)-or-later$/) {
+                $has_or_later{"$1-$2"} = 1;
+            }
+        }
+
+        my @kept;
+        my %seen;
+        for my $term (@terms) {
+            if ($term =~ /^(GPL|LGPL)-(\d+(?:\.\d+)?)-only$/
+                and $has_or_later{"$1-$2"}) {
+                next;
+            }
+
+            next if ($seen{$term}++);
+            push @kept, $term;
+        }
+
+        $license = join(' OR ', @kept);
+    }
 
     my $usebuildpl=0;
     if (grep /^Build\.PL$/, @files) {
@@ -1043,7 +1634,7 @@ END
 Summary:        $summary
 License:        $license
 URL:            $url
-#!RemoteAsset
+#!RemoteAsset:  sha256:@{[$sha256 ? $sha256 : ""]}
 Source0:        $source
 END
 
@@ -1149,7 +1740,7 @@ END
     }
 
     if (@filter_requires) {
-        print $spec <<END
+        print $spec <<END;
 
 Source98:       $name-filter-requires.sh
 \%global real_perl_requires \%{__perl_requires}
@@ -1158,7 +1749,7 @@ END
     }
 
     if (@filter_provides) {
-        print $spec <<END
+        print $spec <<END;
 
 Source99:       $name-filter-provides.sh
 \%global real_perl_provides \%{__perl_provides}
@@ -1242,9 +1833,9 @@ END
         print $spec <<END;
 find $macro{buildroot} -type f -name '*.bs' -size 0 -exec rm -f {} \\;
 END
-}
+    }
 
-        print $spec <<END;
+    print $spec <<END;
 \%perl_process_packlist
 END
 
@@ -1278,10 +1869,12 @@ END
     print $spec <<END;
 
 \%changelog
-\%{?autochangelog}
+\%autochangelog
 END
 
     $spec->close();
+
+    postprocess_spec($specfile) if (!$skip_postprocess);
 
     build_rpm($specfile) if ($buildsrpm or $buildrpm);
 
