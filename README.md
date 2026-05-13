@@ -6,5 +6,6 @@ Please install these modules first (You can use `cpanm`):
  - Text::Autoformat
  - YAML
  - LWP::UserAgent
+ - LWP::Protocol::https
  - Parse::CPAN::Packages
  - Digest::SHA

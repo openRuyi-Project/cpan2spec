@@ -241,7 +241,7 @@ our $outdir='library-perl';   # default output dir
 our $cleanup_source=1;        # default: remove downloaded source archives
 our $skip_postprocess=0;      # default: enable spec post-processing
 our $source;
-our $cpan=$ENV{'CPAN'} || "http://www.cpan.org";
+our $cpan=$ENV{'CPAN'} || "https://www.cpan.org";
 
 our $home=$ENV{'HOME'} || (getpwuid($<))[7];
 die "Can't locate home directory.  Please define \$HOME.\n"
