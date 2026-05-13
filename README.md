@@ -7,3 +7,4 @@ Please install these modules first (You can use `cpanm`):
  - YAML
  - LWP::UserAgent
  - Parse::CPAN::Packages
+ - Digest::SHA
