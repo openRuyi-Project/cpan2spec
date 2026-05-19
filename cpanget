@@ -2,7 +2,7 @@
 
 set -e
 
-CPAN=${CPAN:-"http://www.cpan.org"}
+CPAN=${CPAN:-"https://www.cpan.org"}
 packages=$HOME/.cpan/sources/modules/02packages.details.txt.gz
 
 quiet=''

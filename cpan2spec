@@ -217,6 +217,7 @@ use File::Basename;
 use LWP::UserAgent;
 use Parse::CPAN::Packages;
 use Pod::Simple::TextContent;
+use Digest::SHA;
 # Apparently gets pulled in by another module.
 #use Cwd;
 
@@ -240,7 +241,7 @@ our $outdir='library-perl';   # default output dir
 our $cleanup_source=1;        # default: remove downloaded source archives
 our $skip_postprocess=0;      # default: enable spec post-processing
 our $source;
-our $cpan=$ENV{'CPAN'} || "http://www.cpan.org";
+our $cpan=$ENV{'CPAN'} || "https://www.cpan.org";
 
 our $home=$ENV{'HOME'} || (getpwuid($<))[7];
 die "Can't locate home directory.  Please define \$HOME.\n"
@@ -568,18 +569,16 @@ sub get_sha256($) {
 
     return "0" x 64 if (!-f $file);
 
-    my @output=`sha256sum "$file" 2>/dev/null`;
+    open my $fh, '<', $file
+        or die "Can't open $file: $!\n";
 
-    if ($? != 0) {
-        warn "Failed to calculate SHA256 for $file: $!\n";
-        return "0" x 64;
-    }
+    binmode $fh;
 
-    if (@output && $output[0] =~ /^([a-f0-9]{64})\s+/) {
-        return $1;
-    }
+    my $sha256 = Digest::SHA->new(256)
+                    ->addfile($fh)
+                    ->hexdigest;
 
-    return "0" x 64;
+    return $sha256 || ("0" x 64);
 }
 
 
