@@ -1218,6 +1218,9 @@ for my $file (@args) {
         $archive=Archive::Zip->new() or die "Archive::Zip->new() failed: $!\n";
         die "Read error on $file\n" unless ($archive->read($file) == AZ_OK);
     }
+    # fix ./cpan2spec Text::Tabs BOGUS PATH DETECTED: Text-Tabs+Wrap-2024.001/
+    my $name_re = quotemeta($name);
+    my $version_re = quotemeta($version);
 
     my @files;
 
@@ -1225,7 +1228,7 @@ for my $file (@args) {
     for my $entry (list_files($archive, $type)) {
         next if ($type eq 'tar' and $entry eq 'pax_global_header');
 
-        if ($entry !~ /^(?:.\/)?($name-(?:v\.?)?$version)(?:\/|$)/) {
+        if ($entry !~ /^(?:\.\/)?($name_re-(?:v\.?)?$version_re)(?:\/|$)/) {
             warn "BOGUS PATH DETECTED: $entry\n";
             $bogus++;
             next;
@@ -1233,7 +1236,7 @@ for my $file (@args) {
             $path=$1;
         }
 
-        $entry=~s,^(?:.\/)?$name-(?:v\.?)?$version/,,;
+        $entry =~ s,^(?:\.\/)?$name_re-(?:v\.?)?$version_re/,,;
         next if (!$entry);
 
         push(@files, $entry);
