@@ -282,6 +282,40 @@ sub print_version {
     exit 0;
 }
 
+sub rpm_safe_perl_module_version {
+    my ($version) = @_;
+
+    return undef unless defined $version;
+
+    $version =~ s/^\s+//;
+    $version =~ s/\s+$//;
+    $version =~ s/^[<>=!~]+\s*//;
+
+    return undef if $version eq '';
+    return undef if $version eq '0';
+
+    # Perl/CPAN decimal-style versions do not always compare correctly
+    # under RPM version ordering.
+    #
+    # Examples:
+    #   CPAN:  1.35 > 1.1901
+    #   RPM:   1.1901 > 1.35
+    #
+    #   CPAN:  0.022 > 0.004001
+    #   RPM:   0.004001 > 0.022
+    #
+    # For these long fractional decimal versions, dropping the explicit
+    # version constraint is safer than emitting an unsatisfiable dependency.
+    if ($version =~ /^\d+\.\d{4,}$/) {
+        return undef;
+    }
+
+    # Normalize leading v, e.g. v1.2.3 -> 1.2.3.
+    $version =~ s/^v//;
+
+    return $version;
+}
+
 sub verbose(@) {
     print STDERR @_, "\n" if ($verbose);
 }
@@ -1702,8 +1736,9 @@ END
             }
         }
         printf $spec "%-16s%s", "BuildRequires:", "perl($dep)";
-        print $spec (" >= " . $build_requires{$dep})
-            if ($build_requires{$dep});
+        my $safe_version = rpm_safe_perl_module_version($build_requires{$dep});
+        print $spec (" >= " . $safe_version)
+            if defined($safe_version);
         print $spec "\n";
     }
 
@@ -1728,7 +1763,9 @@ END
         next if (!$compat and exists($corelist{$dep}));
         if ($requires{$dep}) {
             printf $spec "%-16s%s", "Requires:", "perl($dep)";
-            print $spec (" >= " . $requires{$dep});
+            my $safe_version = rpm_safe_perl_module_version($requires{$dep});
+            print $spec (" >= " . $safe_version)
+                if defined($safe_version);
             print $spec "\n";
         }
     }
